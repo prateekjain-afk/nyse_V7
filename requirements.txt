@@ -1,0 +1,14 @@
+streamlit
+tqdm
+pandas
+numpy
+requests
+yfinance
+pytz
+ColumnTransformer
+Pipeline
+OneHotEncoder
+SimpleImputer
+log_loss
+HistGradientBoostingClassifier
+CalibratedClassifierCV
