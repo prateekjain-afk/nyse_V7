@@ -12,3 +12,11 @@ SimpleImputer
 log_loss
 HistGradientBoostingClassifier
 CalibratedClassifierCV
+streamlit
+tqdm
+pandas
+numpy
+requests
+yfinance
+pytz
+scikit-learn
