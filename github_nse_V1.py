@@ -1,18 +1,4 @@
-# -*- coding: utf-8 -*-
-# @title NYSE Intraday Scanner - Robust ML + Consistent Stops + Time-Exit EV V5 (US Equities, ET)
-# Converted from your NSE scanner to NYSE regular session (America/New_York).
-# - Keeps dynamic TP/SL ("TPSL") barriers: structural + ATR14 + pre-entry range + intraday ATR + TOD vol clustering
-# - Keeps ML probability model: RR-aware TP/SL/NONE with calibrated classifier + empirical blending
-# - Keeps target reachability filters (ATR + historical MFE quantile caps)
-# - Keeps realized TP/SL check through end-of-day
-#
-# Notes:
-# - Universe defaults to NYSE listed symbols from NasdaqTrader (otherlisted.txt, Exchange='N'). You can swap to any US universe list.
-# - Calendar uses exchange_calendars/pandas_market_calendars when installed; otherwise weekday fallback.
-# - Timezone: America/New_York (EST/EDT) handled via pytz.
-#
-# DISCLAIMER: This is research/education code, not financial advice.
-
+# @title NSE Intraday Scanner - Robust ML + Consistent Stops + Time-Exit EV V5
 from __future__ import annotations
 
 import os, re, math, time, gzip, pickle, logging, warnings, io, random
@@ -53,34 +39,27 @@ API_PROVIDER = "YFINANCE"
 API_KEY = ""
 
 MAX_UNIVERSE = 500
-MAX_WORKERS = 6
+MAX_WORKERS = 5
 PICK_BUFFER_MULT = 4
 
-CACHE_DIR = "cache_nyse_scan"
+CACHE_DIR = "cache_nse_scan"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# US regime proxy
-REGIME_TICKER = "SPY"
+REGIME_TICKER = "NIFTYBEES.NS"
 RELAX_PRESET = "VWAP_TREND"
 
-UNIVERSE_SOURCE = "NYSE"
-UNIVERSE_CACHE_SIZE = 600  # SP500 is 500; allow some buffer if you swap lists
-
-# Universe fetch controls (must be defined before DataClient.list_stocks() runs)
-FORCE_REFRESH_UNIVERSE = False       # set True to bypass cached universe and refetch now
-CACHE_FALLBACK_UNIVERSE = False      # set True ONLY if you want to cache the tiny fallback list
-US_EXCHANGE_FILTER = {"N"}      # "N"=NYSE, "Q"=NASDAQ. Add "A","P" if you want NYSE American/Arca.
-
+UNIVERSE_SOURCE = "NSE"
+UNIVERSE_CACHE_SIZE = 900
 
 RVOL_INTERVAL = "5m"
-RVOL_PERIOD = "15d"   # enough for ~10 sessions + buffer
+RVOL_PERIOD = "15d"   # enough for 10 sessions + buffer
 
 
 # ============================================================
 # RUN MODE TOGGLE (LIVE vs SIMULATION)
 # ============================================================
 SIMULATION_MODE = True
-SIM_TEST_DT = dt(2026, 2, 17, 11, 00)  # naive treated as America/New_York
+SIM_TEST_DT = dt(2026, 2, 18, 11, 00)  # naive treated as IST
 
 # ============================================================
 # OVERLAYS / FILTERS
@@ -106,8 +85,8 @@ PROB_INTERVAL = "5m"
 PROB_PERIOD = "60d"
 
 PROB_TRAIN_LOOKBACK_SESSIONS = 45
-PROB_TRAIN_TICKERS_MAX = 250
-PROB_PREFETCH_BATCH = 80
+PROB_TRAIN_TICKERS_MAX = 220
+PROB_PREFETCH_BATCH = 60
 
 PROB_USE_ASOF_TIME = True
 PROB_TIE_POLICY = "STOP"       # STOP: treat TIE as SL; HALF: treat as NONE-ish
@@ -118,7 +97,7 @@ INTRADAY_CACHE_TTL_1M = 10 * 60
 INTRADAY_CACHE_TTL_5M = 60 * 60
 
 # RR choices: include 0.75 to reduce "NONE all day" when stops are wider (safer sizing).
-RR_GRID = [0.75, 1.0, 1.25, 1.5, 2.0]
+RR_GRID = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 # ============================================================
 # TAKE / PASS decision thresholds (base; will be regime-adjusted)
@@ -142,6 +121,9 @@ TARGET_MAX_PCT = 0.12          # fallback cap if ATR missing
 # ============================================================
 # Dynamic TP/SL barrier modeling (safe, data-available)
 # ============================================================
+# These settings improve realism: stops adapt to *known* intraday volatility at entry,
+# and targets (RR choices) are capped by what has been historically achievable for that
+# ticker at the same entry time (no peeking into the current day).
 ENABLE_DYNAMIC_STOP_FROM_INTRA_RANGE = True
 STOP_INTRA_RANGE_MULT = 0.60   # stop distance floor = 0.60 * (high-low from open->entry)
 
@@ -170,23 +152,30 @@ BREADTH_STRICTEN_FACTOR = 0.20  # 20%
 # ============================================================
 # Intraday ATR + Vol-clustering (time-of-day + volatility shock)
 # ============================================================
+# Why:
+# - Daily ATR (ATR14) is too slow for sudden intraday spikes.
+# - NSE's first ~45 minutes often has "volatility clustering" (bigger swings),
+#   while mid-day is usually calmer. We widen stops in volatile windows and
+#   tighten them in calmer windows to reduce random stop-outs and reduce
+#   unrealistic TP/SL expectations.
 ENABLE_INTRADAY_ATR = True
 INTRA_ATR_BARS = 12            # last ~60 minutes on 5m bars (12 * 5m)
 INTRA_ATR_LEN  = 12            # ATR length on those bars
 INTRA_ATR_STOP_MULT = 1.00     # stop distance floor = atr_intra * mult * vol_mult
 
 ENABLE_VOL_CLUSTERING_TOD = True
-# Time-of-day volatility multipliers (America/New_York). Calibrated for open/close volatility.
+# Time-of-day volatility multipliers (IST). Calibrated for "open chaos" vs mid-day lull.
 TOD_VOL_SCHEDULE = [
-    (dtime(9, 30), dtime(10, 15), 1.35),
-    (dtime(10, 15), dtime(12, 0), 1.10),
-    (dtime(12, 0), dtime(14, 30), 0.95),
-    (dtime(14, 30), dtime(15, 30), 1.10),
-    (dtime(15, 30), dtime(16, 0), 1.25),
+    (dtime(9, 15), dtime(10, 0), 1.35),
+    (dtime(10, 0), dtime(11, 30), 1.15),
+    (dtime(11, 30), dtime(14, 0), 1.00),
+    (dtime(14, 0), dtime(15, 0), 1.10),
+    (dtime(15, 0), dtime(15, 30), 1.25),
 ]
 
 # "Vol shock" multiplier: compares intraday ATR to a rough expected 5m ATR implied by daily ATR.
-BARS_PER_SESSION_5M = 78  # 390 minutes / 5
+# This captures volatility clustering beyond time-of-day (e.g., news spikes).
+BARS_PER_SESSION_5M = 75
 VOL_SHOCK_CLAMP_LO, VOL_SHOCK_CLAMP_HI = 0.80, 1.80
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -226,21 +215,22 @@ def vol_cluster_multiplier(clock: dtime, atr_intra: float, atr14: float) -> floa
     base = tod_vol_multiplier(clock)
     shock = 1.0
     if ENABLE_INTRADAY_ATR and np.isfinite(atr_intra) and np.isfinite(atr14) and atr14 > 0:
+        # Expected 5m ATR implied by daily ATR (rough random-walk scaling).
         expected_5m_atr = atr14 / np.sqrt(BARS_PER_SESSION_5M)
         if expected_5m_atr > 0:
             shock = _clamp(atr_intra / expected_5m_atr, VOL_SHOCK_CLAMP_LO, VOL_SHOCK_CLAMP_HI)
     return float(base * shock)
 
 # Timezone
-ET = pytz.timezone("America/New_York")   # keep variable name ET for minimal changes in code paths
-EASTERN = ET
+ET = pytz.timezone("Asia/Kolkata")   # keep variable name ET for minimal changes in code paths
+IST = ET
 UTC = pytz.UTC
 
 
 # ============================================================
 # LOGGING
 # ============================================================
-logger = logging.getLogger("nyse_scanner")
+logger = logging.getLogger("nse_scanner")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     h = logging.StreamHandler()
@@ -249,7 +239,7 @@ if not logger.handlers:
     h.setFormatter(fmt)
     logger.addHandler(h)
 
-logger.info(f" NYSE Scanner | API={API_PROVIDER} | MAX_UNIVERSE={MAX_UNIVERSE} | ML={SKLEARN_OK}")
+logger.info(f"🚀 NSE Scanner | API={API_PROVIDER} | MAX_UNIVERSE={MAX_UNIVERSE} | ML={SKLEARN_OK}")
 
 
 # ============================================================
@@ -258,12 +248,12 @@ logger.info(f" NYSE Scanner | API={API_PROVIDER} | MAX_UNIVERSE={MAX_UNIVERSE} |
 @dataclass
 class ScanConfig:
     price_min: float = 5.0
-    avg10_dollar_vol_min: float = 1.0e7   # USD notional label only
+    avg10_dollar_vol_min: float = 1.0e7   # treated as INR notional now (label only)
     max_universe: int = MAX_UNIVERSE
 
-    opening_range_start: dtime = dtime(9, 30)
-    opening_range_end: dtime = dtime(10, 0)     # 30-min OR for NYSE
-    eval_time_default: dtime = dtime(10, 15)
+    opening_range_start: dtime = dtime(9, 15)
+    opening_range_end: dtime = dtime(9, 45)    # 30-min OR for NSE
+    eval_time_default: dtime = dtime(10, 0)
 
     rvol_min: float = 0.8
     rvol_lookback_sessions: int = 10
@@ -279,10 +269,10 @@ class ScanConfig:
     orh_tol_pct: float = 0.05
 
     score_min: float = 40.0
-    max_per_sector: int = 5
+    max_per_sector: int = 8
     target_positions: int = 40
 
-    min_pos_dollars: float = 1500.0  # USD
+    min_pos_dollars: float = 1500.0  # treated as INR now (label only)
     stop_buffer_below_15m_low: float = 0.005
     rr_min: float = 1.0
 
@@ -290,7 +280,7 @@ cfg = ScanConfig()
 
 logger.info(
     f"Preset={RELAX_PRESET} | rvol_min={cfg.rvol_min} | score_min={cfg.score_min} | "
-    f"liq_min(USD notional)={cfg.avg10_dollar_vol_min:,.0f}"
+    f"liq_min(INR notional)={cfg.avg10_dollar_vol_min:,.0f}"
 )
 
 # ============================================================
@@ -316,7 +306,7 @@ class SimpleFileCache:
         try:
             with gzip.open(path, "rb") as f:
                 return pickle.load(f)
-        except Exception:
+        except:
             return None
 
     def set(self, key: str, value: Any) -> None:
@@ -352,7 +342,7 @@ def safe_div(a: float, b: float, default: float = 0.0) -> float:
         if b == 0 or np.isnan(b):
             return default
         return a / b
-    except Exception:
+    except:
         return default
 
 def dt_combine(d: date, t: dtime, tz=ET) -> dt:
@@ -365,12 +355,12 @@ def minutes_between(a: dt, b: dt) -> float:
     return float((b - a).total_seconds() / 60.0)
 
 # ============================================================
-# NYSE TRADING CALENDAR (best effort)
+# NSE TRADING CALENDAR (best effort)
 # ============================================================
-def _get_nyse_calendar():
+def _get_nse_calendar():
     try:
         import exchange_calendars as xcals
-        for name in ("XNYS", "NYSE", "XNAS"):
+        for name in ("XNSE", "NSE", "XBOM"):
             try:
                 cal = xcals.get_calendar(name)
                 return ("exchange_calendars", cal)
@@ -381,7 +371,7 @@ def _get_nyse_calendar():
 
     try:
         import pandas_market_calendars as mcal
-        for name in ("NYSE", "XNYS", "NASDAQ", "XNAS"):
+        for name in ("NSE", "XNSE", "BSE", "XBOM"):
             try:
                 cal = mcal.get_calendar(name)
                 return ("pandas_market_calendars", cal)
@@ -392,11 +382,11 @@ def _get_nyse_calendar():
 
     return ("weekday_fallback", None)
 
-_CAL_MODE, _EXCH = _get_nyse_calendar()
+_CAL_MODE, _EXCH = _get_nse_calendar()
 if _CAL_MODE == "weekday_fallback":
-    logger.warning(" Trading calendar fallback is weekday-only (won't know US market holidays/early closes). Install exchange_calendars for best results.")
+    logger.warning("⚠️ Trading calendar fallback is weekday-only (won't know NSE holidays). Install exchange_calendars for best results.")
 else:
-    logger.info(f" Trading calendar mode: {_CAL_MODE}")
+    logger.info(f"✅ Trading calendar mode: {_CAL_MODE}")
 
 def is_trading_day(d: date) -> bool:
     if _EXCH is None:
@@ -448,21 +438,10 @@ def get_last_trading_day(now_et: dt) -> date:
     return now_et.date()
 
 def get_session_open_close(d: date) -> Tuple[dt, dt]:
-    # Handles early closes if calendar supports it (exchange_calendars has special closes)
-    if _EXCH is not None and _CAL_MODE == "exchange_calendars":
-        try:
-            sess = pd.Timestamp(d, tz="UTC")
-            # exchange_calendars sessions are in UTC; get open/close and convert
-            o = _EXCH.session_open(sess).to_pydatetime().astimezone(ET)
-            c = _EXCH.session_close(sess).to_pydatetime().astimezone(ET)
-            return o, c
-        except Exception:
-            pass
-    # Fallback to regular hours
-    return dt_combine(d, cfg.opening_range_start, ET), dt_combine(d, dtime(16, 0), ET)
+    return dt_combine(d, cfg.opening_range_start, ET), dt_combine(d, dtime(15, 30), ET)
 
 # ============================================================
-# UNIVERSE HELPERS (S&P 500; fallback hardcoded)
+# UNIVERSE HELPERS (NIFTY500 preferred; fallback to EQUITY_L)
 # ============================================================
 _http_rl = RateLimiter(60)
 
@@ -470,8 +449,9 @@ def _http_get_text(url: str, timeout: int = 45, retries: int = 3, backoff: float
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/plain,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
+        "Referer": "https://www.nseindia.com/",
     }
     last_err = None
     for i in range(max(1, retries)):
@@ -485,249 +465,101 @@ def _http_get_text(url: str, timeout: int = 45, retries: int = 3, backoff: float
             time.sleep((backoff ** i) + random.random() * 0.25)
     raise RuntimeError(f"GET failed for {url}: {last_err}")
 
-def fetch_us_universe() -> pd.DataFrame:
-    """
-    Return a US-listed symbol universe as a DataFrame with columns: ticker, name, exchange.
+def _clean_nse_symbol(sym: str) -> Optional[str]:
+    if not isinstance(sym, str):
+        return None
+    s = sym.strip().upper()
+    if not s:
+        return None
+    if any(ch in s for ch in ["$", "^", "/", "\\", " "]):
+        return None
+    if not re.match(r"^[A-Z0-9\-\&]{1,20}$", s):
+        return None
+    return s
 
-    Primary source: NasdaqTrader Symbol Directory (exchange-filtered).
-    Fallbacks: GitHub-maintained exchange lists, then Wikipedia S&P 500, then a small hardcoded list.
+def fetch_nse_universe() -> pd.DataFrame:
+    cache_key = "nse_universe_v3"
+    cached = cache.get(cache_key, ttl_seconds=24 * 3600)
+    if cached is not None and isinstance(cached, pd.DataFrame) and not cached.empty:
+        return cached.copy()
 
-    Notes:
-      - Symbols are normalized for yfinance (e.g., BRK.B -> BRK-B).
-      - If all web sources are unreachable, the scanner still runs using a small fallback list.
-    """
-    want = set(str(x).strip().upper() for x in (US_EXCHANGE_FILTER or {"N", "Q"}))
-    # Normalize some common exchange aliases
-    if "NYSE" in want:
-        want.discard("NYSE")
-        want.add("N")
-    if "NASDAQ" in want:
-        want.discard("NASDAQ")
-        want.add("Q")
-
-    cache_key = f"us_universe_v4_{'_'.join(sorted(want))}_{UNIVERSE_CACHE_SIZE}"
-    if cache and (not FORCE_REFRESH_UNIVERSE):
-        cached = cache.get(cache_key, ttl_seconds=24 * 3600)
-        if cached:
-            try:
-                df = pd.read_json(cached, orient="records")
-                if {"ticker", "name", "exchange"}.issubset(df.columns) and len(df) > 0:
-                    return df
-            except Exception:
-                pass
-
-    rows = []
-    seen = set()
-
-    def _clean_symbol(sym: str) -> Optional[str]:
-        if sym is None:
-            return None
-        s = str(sym).strip().upper().replace(".", "-")
-        # yfinance doesn't like spaces or weird chars
-        if not re.match(r"^[A-Z0-9][A-Z0-9\-]{0,9}$", s):
-            return None
-        return s
-
-    def _add_symbol(sym: str, name: str, exch: str) -> None:
-        s = _clean_symbol(sym)
-        if not s or (s in seen):
-            return
-        # Skip obvious non-common-stock artifacts
-        if any(ch in s for ch in ["^", "=", "$", "/"]):
-            return
-        seen.add(s)
-        rows.append({"ticker": s, "name": str(name).strip() if name else s, "exchange": (exch or "US").strip().upper()})
-
-    fail_notes = []
-
-    # --- NasdaqTrader symbol directory (best quality; exchange-filtered) ---
-    nt_sources = [
-        ("otherlisted", "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"),
-        ("nasdaqlisted", "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"),
-        ("nasdaqtraded", "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt"),
+    # Try NIFTY500 constituent list (archives)
+    urls = [
+        "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
+        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
     ]
 
-    for tag, url in nt_sources:
+    df = None
+    used = None
+    for u in urls:
         try:
-            t = _http_get_text(url, timeout=45, retries=3)
-            all_lines = [ln for ln in t.splitlines() if ln and not ln.startswith("File Creation Time")]
-            if len(all_lines) < 3:
-                fail_notes.append(f"{tag}: too few lines")
-                continue
-
-            header = all_lines[0]
-            cols = [c.strip() for c in header.split("|")]
-            hmap = {c: i for i, c in enumerate(cols)}
-            data_lines = [ln for ln in all_lines[1:] if "|" in ln and not ln.startswith("Symbol|") and not ln.startswith("ACT Symbol|") and not ln.startswith("NASDAQ Traded|")]
-
-            if tag == "otherlisted":
-                sym_i = hmap.get("ACT Symbol", hmap.get("Symbol"))
-                name_i = hmap.get("Security Name")
-                exch_i = hmap.get("Exchange")
-                test_i = hmap.get("Test Issue")
-                if sym_i is None or exch_i is None:
-                    fail_notes.append(f"{tag}: missing columns")
-                    continue
-
-                for row in data_lines:
-                    parts = row.split("|")
-                    if len(parts) <= max(sym_i, exch_i):
-                        continue
-                    exch = parts[exch_i].strip().upper()
-                    if exch not in want:
-                        continue
-                    test_flag = parts[test_i].strip().upper() if (test_i is not None and test_i < len(parts)) else ""
-                    if test_flag == "Y":
-                        continue
-                    sym = parts[sym_i].strip()
-                    nm = parts[name_i].strip() if (name_i is not None and name_i < len(parts)) else sym
-                    _add_symbol(sym, nm, exch)
-
-            elif tag == "nasdaqlisted":
-                # This file is NASDAQ-only; include it only if Q is requested.
-                if "Q" not in want:
-                    continue
-                sym_i = hmap.get("Symbol")
-                name_i = hmap.get("Security Name")
-                test_i = hmap.get("Test Issue")
-                if sym_i is None:
-                    fail_notes.append(f"{tag}: missing Symbol column")
-                    continue
-
-                for row in data_lines:
-                    parts = row.split("|")
-                    if len(parts) <= sym_i:
-                        continue
-                    test_flag = parts[test_i].strip().upper() if (test_i is not None and test_i < len(parts)) else ""
-                    if test_flag == "Y":
-                        continue
-                    sym = parts[sym_i].strip()
-                    nm = parts[name_i].strip() if (name_i is not None and name_i < len(parts)) else sym
-                    _add_symbol(sym, nm, "Q")
-
-            elif tag == "nasdaqtraded":
-                # Format includes: Symbol|Security Name|Listing Exchange|...|Test Issue|...
-                sym_i = hmap.get("Symbol")
-                name_i = hmap.get("Security Name")
-                exch_i = hmap.get("Listing Exchange", hmap.get("Exchange"))
-                test_i = hmap.get("Test Issue")
-                if sym_i is None or exch_i is None:
-                    fail_notes.append(f"{tag}: missing columns")
-                    continue
-
-                for row in data_lines:
-                    parts = row.split("|")
-                    if len(parts) <= max(sym_i, exch_i):
-                        continue
-                    exch = parts[exch_i].strip().upper()
-                    if exch not in want:
-                        continue
-                    test_flag = parts[test_i].strip().upper() if (test_i is not None and test_i < len(parts)) else ""
-                    if test_flag == "Y":
-                        continue
-                    sym = parts[sym_i].strip()
-                    nm = parts[name_i].strip() if (name_i is not None and name_i < len(parts)) else sym
-                    _add_symbol(sym, nm, exch)
-
-            if len(rows) >= max(1000, UNIVERSE_CACHE_SIZE):
+            txt = _http_get_text(u, timeout=60, retries=4)
+            df0 = pd.read_csv(io.StringIO(txt))
+            if df0 is not None and not df0.empty:
+                df = df0
+                used = u
                 break
-
-        except Exception as e:
-            fail_notes.append(f"{tag}: {type(e).__name__}: {e}")
-
-    # --- GitHub fallback (plain text lists) ---
-    if len(rows) < 100:
-        gh_sources = []
-        if "N" in want:
-            gh_sources.append(("github_nyse", "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nyse/nyse_tickers.txt", "N"))
-        if "Q" in want:
-            gh_sources.append(("github_nasdaq", "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_tickers.txt", "Q"))
-        # Always keep a last-resort all-exchanges list.
-        gh_sources.append(("github_all", "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt", "US"))
-
-        for tag, url, exch in gh_sources:
-            try:
-                t = _http_get_text(url, timeout=45, retries=3)
-                before = len(rows)
-                for raw in t.splitlines():
-                    raw = raw.strip()
-                    if not raw or raw.startswith("#"):
-                        continue
-                    _add_symbol(raw, raw, exch)
-                added = len(rows) - before
-                if added > 0:
-                    logger.info(f"Universe source {tag}: added {added} symbols (total={len(rows)})")
-                if len(rows) >= max(500, UNIVERSE_CACHE_SIZE):
-                    break
-            except Exception as e:
-                fail_notes.append(f"{tag}: {type(e).__name__}: {e}")
-
-    # --- Wikipedia fallback (S&P 500) ---
-    if len(rows) < 100:
-        try:
-            html = _http_get_text("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", timeout=60, retries=3)
-            tables = pd.read_html(html)
-            if tables:
-                df = tables[0]
-                if "Symbol" in df.columns:
-                    for _, r in df.iterrows():
-                        sym = str(r.get("Symbol", "")).strip()
-                        nm = str(r.get("Security", sym)).strip()
-                        _add_symbol(sym, nm, "US")
-        except Exception as e:
-            fail_notes.append(f"wikipedia_sp500: {type(e).__name__}: {e}")
-
-    # --- Hardcoded last-resort fallback ---
-    if not rows:
-        fallback = ["JPM", "XOM", "JNJ", "UNH", "PG", "KO", "WMT", "DIS", "V", "HD"]
-        for sym in fallback:
-            _add_symbol(sym, sym, "N")
-        logger.warning("Universe fetch failed from web sources; using small fallback list.")
-
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out = out.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-
-    # Cache:
-    # - Always cache a meaningful universe (>=100 symbols)
-    # - Optionally cache the tiny fallback list if user explicitly enables CACHE_FALLBACK_UNIVERSE
-    if cache and (not FORCE_REFRESH_UNIVERSE):
-        try:
-            if len(out) >= 100:
-                cache.set(cache_key, out.to_json(orient="records"), ttl_seconds=24 * 3600)
-            elif CACHE_FALLBACK_UNIVERSE:
-                cache.set(cache_key, out.to_json(orient="records"), ttl_seconds=6 * 3600)
         except Exception:
-            pass
+            continue
 
-    if fail_notes:
-        logger.warning("Universe fetch notes: " + " | ".join(fail_notes[:6]) + (" ..." if len(fail_notes) > 6 else ""))
+    if df is None or df.empty:
+        out = pd.DataFrame({"ticker": ["RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS"],
+                            "name": ["RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK"], "exchange": ["NSE"]*5})
+        cache.set(cache_key, out)
+        logger.info(f"✅ Fetched {len(out)} NSE tickers (fallback hardcoded)")
+        return out.copy()
 
+    # Parse depending on file
+    sym_col = None
+    name_col = None
+    for c in ["Symbol", "SYMBOL"]:
+        if c in df.columns:
+            sym_col = c
+            break
+    for c in ["Company Name", "Security Name", "NAME OF COMPANY", "NAME"]:
+        if c in df.columns:
+            name_col = c
+            break
+
+    if sym_col is None:
+        sym_col = df.columns[0]
+
+    rows = []
+    for _, r in df.iterrows():
+        sym = _clean_nse_symbol(str(r.get(sym_col, "")))
+        if not sym:
+            continue
+        tkr = f"{sym}.NS"
+        nm = str(r.get(name_col, sym)).strip() if name_col else sym
+        rows.append({"ticker": tkr, "name": nm, "exchange": "NSE"})
+
+    out = pd.DataFrame(rows).drop_duplicates("ticker").reset_index(drop=True)
+    cache.set(cache_key, out)
+    if used and "nifty500" in used.lower():
+        logger.info(f"✅ Fetched {len(out)} NSE tickers (NIFTY500 preferred; fallback: EQUITY_L)")
+    else:
+        logger.info(f"✅ Fetched {len(out)} NSE tickers (EQUITY_L)")
     return out.copy()
 
-
+# ============================================================
+# DATA CLIENT - YFINANCE + CACHE
+# ============================================================
 class DataClient:
     def __init__(self, cache_obj: Optional[SimpleFileCache] = None):
         self.cache = cache_obj
+        # Cache validity controls (set by the main run block)
         self.require_end_dt = None  # tz-aware datetime; if cache ends before this, we refetch
         self.force_refresh = False  # if True, bypass cache reads entirely
         self.rl = RateLimiter(60)
 
     def list_stocks(self) -> pd.DataFrame:
-        cache_key = f"us_universe_list_v4_{UNIVERSE_CACHE_SIZE}"
-        cached = None
-        if self.cache and (not FORCE_REFRESH_UNIVERSE):
-            cached = self.cache.get(cache_key, ttl_seconds=24 * 3600)
-        if (
-            cached is not None
-            and isinstance(cached, pd.DataFrame)
-            and (not cached.empty)
-            and (len(cached) >= 100)
-        ):
+        cache_key = f"nse_universe_list_v3_{UNIVERSE_CACHE_SIZE}"
+        cached = self.cache.get(cache_key, ttl_seconds=24 * 3600) if self.cache else None
+        if cached is not None and isinstance(cached, pd.DataFrame) and not cached.empty:
             logger.info(f"Using cached universe: {len(cached)} stocks")
             return cached.copy()
 
-        uni = fetch_us_universe()
+        uni = fetch_nse_universe()
         df = uni.copy()
         df["symbol"] = df["ticker"]
         df = df.head(UNIVERSE_CACHE_SIZE).reset_index(drop=True)
@@ -741,7 +573,7 @@ class DataClient:
     def _daily_cache_key(self, symbols: List[str], start_date: date, end_date: date) -> str:
         syms = sorted([s for s in symbols if isinstance(s, str)])
         sig = str(hash(tuple(syms[:200])))
-        return f"daily_us_v1_{start_date}_{end_date}_{len(syms)}_{sig}"
+        return f"daily_nse_v6_{start_date}_{end_date}_{len(syms)}_{sig}"
 
     def get_daily_data(self, symbols: List[str], start_date: date, end_date: date) -> pd.DataFrame:
         cache_key = self._daily_cache_key(symbols, start_date, end_date)
@@ -791,7 +623,7 @@ class DataClient:
         return out.copy()
 
     def _intraday_cache_key(self, symbol: str, interval: str, period: str) -> str:
-        return f"intraday_us_v2_{symbol}_{interval}_{period}"
+        return f"intraday_nse_v9_{symbol}_{interval}_{period}"
 
     def _fetch_intraday_raw(self, symbol: str, interval: str, period: str, ttl: int) -> pd.DataFrame:
         cache_key = self._intraday_cache_key(symbol, interval, period)
@@ -799,12 +631,13 @@ class DataClient:
         if self.force_refresh:
             cached = None
         if cached is not None and isinstance(cached, pd.DataFrame):
+            # If the cached file is too old to cover the requested simulation window, refetch.
             if self.require_end_dt is not None and not cached.empty:
                 try:
-                    last_ts = pd.Timestamp(cached.index.max())
+                    last_ts = cached.index.max()
+                    last_ts = pd.Timestamp(last_ts).to_pydatetime()
                     if last_ts.tzinfo is None:
-                        last_ts = last_ts.tz_localize(UTC)
-                    last_ts = last_ts.tz_convert(ET).to_pydatetime()
+                        last_ts = UTC.localize(last_ts).astimezone(ET)
                     if last_ts < self.require_end_dt:
                         cached = None
                 except Exception:
@@ -855,6 +688,8 @@ class DataClient:
             return pd.DataFrame()
 
         day = raw[raw.index.date == date_].copy()
+        # If we're simulating and the cached window doesn't include this day (common when changing SIM_TEST_DT),
+        # force a one-time refresh and try again.
         if day.empty and self.require_end_dt is not None and (not self.force_refresh):
             try:
                 old_force = self.force_refresh
@@ -1067,7 +902,7 @@ NEGATIVE_NEWS_KEYWORDS = [
 POSITIVE_NEWS_KEYWORDS = ["raises guidance", "beats", "upgrade", "contract", "partnership", "record revenue"]
 
 def fetch_yfinance_news_risk(ticker: str) -> Dict[str, Any]:
-    cache_key = f"news_yf_us_v2_{ticker}_{NEWS_LOOKBACK_HOURS}"
+    cache_key = f"news_yf_nse_v2_{ticker}_{NEWS_LOOKBACK_HOURS}"
     cached = cache.get(cache_key, ttl_seconds=30 * 60)
     if cached is not None:
         return cached
@@ -1087,7 +922,7 @@ def fetch_yfinance_news_risk(ticker: str) -> Dict[str, Any]:
         if ts is not None:
             try:
                 pub = dt.fromtimestamp(int(ts), tz=UTC)
-            except Exception:
+            except:
                 pub = None
         if title and (pub is None or pub >= cutoff):
             titles.append(title)
@@ -1129,7 +964,7 @@ earnings_rl = RateLimiter(60)
 def has_earnings_soon(ticker: str) -> bool:
     if not ENABLE_EARNINGS_BLACKOUT:
         return False
-    cache_key = f"earnings_us_v3_{ticker}_{EARNINGS_BLACKOUT_DAYS}"
+    cache_key = f"earnings_nse_v3_{ticker}_{EARNINGS_BLACKOUT_DAYS}"
     cached = cache.get(cache_key, ttl_seconds=6 * 3600)
     if cached is not None:
         return bool(cached)
@@ -1168,7 +1003,7 @@ def has_earnings_soon(ticker: str) -> bool:
 sector_rl = RateLimiter(60)
 
 def get_sector_yf(ticker: str) -> str:
-    cache_key = f"sector_us_v3_{ticker}"
+    cache_key = f"sector_nse_v3_{ticker}"
     cached = cache.get(cache_key, ttl_seconds=7 * 24 * 3600)
     if cached is not None:
         return str(cached)
@@ -1233,6 +1068,7 @@ def atr_asof(atr_lookup: Dict[str, Tuple[List[date], List[float]]], ticker: str,
 
 # ============================================================
 # CONSISTENT STOP FUNCTION (ROBUSTNESS FIX)
+# - Used by BOTH allocation AND training simulation to avoid mismatch.
 # ============================================================
 def compute_stop_auto(
     entry: float,
@@ -1248,14 +1084,18 @@ def compute_stop_auto(
 
     Components (then clamped):
       - Structural: below pre-entry lows (last-15m low and/or session low) minus buffer
-      - ATR14: daily volatility-aware floor
+      - ATR14: daily volatility-aware floor (prevents overly tight stops on large names)
       - Intraday floors:
-          * pre-entry range floor
-          * intraday ATR floor
-      - Vol clustering multiplier (TOD + shock)
+          * pre-entry range floor (reacts to noisy opens)
+          * intraday ATR floor (reacts to sudden spikes even mid-day)
+      - Vol clustering multiplier: widens floors in known volatile windows (open/close) and
+        during volatility shocks (intraday ATR >> expected).
+
+    Note: Lower stop = wider risk. We start with the *tighter* of structural vs ATR14,
+    then widen only if the intraday floors say the stop is unrealistically tight.
     """
     entry = float(entry)
-
+    # --- Base candidates ---
     structural_low = last15_low
     if np.isfinite(session_low):
         structural_low = min(structural_low, session_low)
@@ -1265,9 +1105,10 @@ def compute_stop_auto(
     if np.isfinite(atr14) and atr14 > 0:
         atr_stop = float(entry - ATR_STOP_MULT * atr14)
 
-    # baseline: tighter of structural vs ATR stop
+    # Pick a "reasonable tight" baseline (higher price = tighter stop)
     stop = float(max(structural, atr_stop))
 
+    # --- Intraday widening floors ---
     vm = float(vol_mult) if np.isfinite(vol_mult) else 1.0
     vm = _clamp(vm, 0.75, 2.0)
 
@@ -1285,7 +1126,7 @@ def compute_stop_auto(
         if rps < floor_rps:
             stop = float(entry - floor_rps)
 
-    # clamp stop distance as % of entry
+    # --- Clamp stop distance as % of entry ---
     if entry > 0:
         stop_pct = float((entry - stop) / entry)
         if stop_pct > STOP_MAX_PCT:
@@ -1295,9 +1136,6 @@ def compute_stop_auto(
 
     return float(stop)
 
-# ============================================================
-# Market breadth (as-of)
-# ============================================================
 def get_market_breadth_asof_intraday(
     universe: List[str],
     d: date,
@@ -1387,23 +1225,27 @@ def get_market_breadth_asof_intraday(
     note = f"breadth(asof) A/D={ratio:.3f} (adv={adv}, dec={dec}, n={n})" if np.isfinite(ratio) else f"breadth(asof) A/D=NaN (adv={adv}, dec={dec}, n={n})"
     return {"ad_ratio": ratio, "adv": adv, "dec": dec, "n": n, "note": note}
 
+
 # ============================================================
 # Resolve analysis datetime (LIVE vs SIMULATION)
 # ============================================================
 if SIMULATION_MODE:
     _dt_raw = ET.localize(SIM_TEST_DT) if getattr(SIM_TEST_DT, 'tzinfo', None) is None else SIM_TEST_DT.astimezone(ET)
-    logger.info(f" SIMULATION MODE: Testing as of {_dt_raw}")
+    logger.info(f"🧪 SIMULATION MODE: Testing as of {_dt_raw}")
 else:
     _dt_raw = dt.now(tz=ET)
 
+# If the requested date is not a trading day, roll back to the most recent trading session.
 _requested_date = _dt_raw.date()
 analysis_date = _requested_date if is_trading_day(_requested_date) else get_last_trading_day(_dt_raw)
 if analysis_date != _requested_date:
-    logger.warning(f"Requested date {_requested_date} is not a US trading day; using {analysis_date} instead.")
+    logger.warning(f"Requested date {_requested_date} is not an NSE trading day; using {analysis_date} instead.")
 
+# as_of uses the requested clock-time on the resolved trading date.
 as_of_et = dt_combine(analysis_date, _dt_raw.time())
 session_open_et, session_close_et = get_session_open_close(analysis_date)
 
+# Clamp as_of into the session so downstream slices always exist.
 if as_of_et < session_open_et:
     logger.warning(f"as_of {as_of_et.time()} is before market open; clamping to {session_open_et.time()}.")
     as_of_et = session_open_et
@@ -1414,17 +1256,21 @@ if as_of_et > session_close_et:
 logger.info(f"Analysis date: {analysis_date} | as_of: {as_of_et.time()} | session_close: {session_close_et.time()}")
 _prev_list = get_trading_days(analysis_date, 1)
 prev_session = _prev_list[-1] if _prev_list else (analysis_date - timedelta(days=1))
-prev_session_date = prev_session
+prev_session_date = prev_session  # alias (date)
 logger.info(f"Previous session: {prev_session_date} | RVOL lookback: {cfg.rvol_lookback_sessions} sessions")
 
+# Cache freshness: if your intraday cache ends before the required date, refetch.
+# This fixes the "old cached day" issue when you change SIM_TEST_DT.
 client.force_refresh = False
 client.require_end_dt = session_close_et if SIMULATION_MODE else None
 
-logger.info("Loading US stock universe...")
+# Load NSE universe (source) and select the scan universe.
+logger.info("Loading NSE stock universe...")
 universe_df = client.list_stocks()
 universe_scan = universe_df['ticker'].astype(str).head(MAX_UNIVERSE).tolist()
-logger.info(f"Final universe: {len(universe_scan)} stocks ({UNIVERSE_SOURCE})")
+logger.info(f"Final universe: {len(universe_scan)} stocks (NSE)")
 
+# Map ticker -> name for display
 name_map: Dict[str, str] = {}
 try:
     if isinstance(universe_df, pd.DataFrame) and "ticker" in universe_df.columns:
@@ -1435,19 +1281,24 @@ try:
 except Exception:
     name_map = {}
 
+# Opening range end datetime (IST) used for ORH computations
 or_end_et = dt_combine(analysis_date, cfg.opening_range_end, ET)
+
+# Historical days for RVOL stats (prior sessions only)
 hist_days = get_trading_days(analysis_date, cfg.rvol_lookback_sessions)
 
+# Daily data for ATR + optional liquidity computations (best-effort)
 daily_start = analysis_date - timedelta(days=max(120, cfg.rvol_lookback_sessions * 6))
 daily_end = analysis_date
 daily_symbols = sorted(set(universe_scan + [REGIME_TICKER]))
 logger.info(f"Fetching daily data for ATR: symbols={len(daily_symbols)}, start={daily_start}, end={daily_end}")
 daily_data = client.get_daily_data(daily_symbols, daily_start, daily_end)
 
+
 breadth = get_market_breadth_asof_intraday(universe_scan, analysis_date, as_of_et, interval="5m", period="60d")
 breadth_ratio = float(breadth["ad_ratio"]) if np.isfinite(breadth["ad_ratio"]) else np.nan
 breadth_strict = bool(np.isfinite(breadth_ratio) and breadth_ratio < BREADTH_NEGATIVE_RATIO)
-logger.info(" " + breadth["note"] + (f" | STRICT(+{int(BREADTH_STRICTEN_FACTOR*100)}%)=True" if breadth_strict else " | STRICT=False"))
+logger.info("📊 " + breadth["note"] + (f" | STRICT(+{int(BREADTH_STRICTEN_FACTOR*100)}%)=True" if breadth_strict else " | STRICT=False"))
 
 def effective_take_thresholds(strict: bool) -> Dict[str, Any]:
     if not strict:
@@ -1558,7 +1409,7 @@ def compute_last_closed_15m_low_today(df_1m: pd.DataFrame) -> float:
     return float(bars15["low"].iloc[-1]) if not bars15.empty else np.nan
 
 # ============================================================
-# STAGE 1: Momentum + VWAP sigma-bands + RS + MACD
+# STAGE 1: Momentum + VWAP σ-bands + RS + MACD
 # ============================================================
 def analyze_ticker_stage1(ticker: str) -> Optional[Dict[str, Any]]:
     try:
@@ -1676,7 +1527,7 @@ def run_stage1(universe: List[str]) -> List[Dict[str, Any]]:
                 out.append(r)
     return out
 
-logger.info("Stage 1: Momentum + VWAP sigma-band tagging...")
+logger.info("Stage 1: Momentum + VWAP σ-band tagging...")
 stage1_results = run_stage1(universe_scan)
 logger.info(f"Stage 1 pass: {len(stage1_results)} stocks")
 
@@ -1688,8 +1539,11 @@ if len(stage1_results) == 0:
     stage1_results = run_stage1(universe_scan)
     logger.info(f"Stage 1 after fallback: {len(stage1_results)} stocks")
 
+
+# Prefetch 5m once for all Stage-1 pass tickers (massive speedup)
 stage1_tickers = [r["ticker"] for r in stage1_results]
 prefetch_intraday_batch(stage1_tickers, interval=RVOL_INTERVAL, period=RVOL_PERIOD, batch_size=80)
+
 
 # ============================================================
 # STAGE 2: RVOL (+ Volume Z-score stats)
@@ -1702,12 +1556,16 @@ def compute_rvol_and_volstats_for_ticker(ticker: str, numerator_vol: float) -> D
         if raw is None or raw.empty:
             return {"rvol": np.nan, "vol_mean": np.nan, "vol_std": np.nan, "vol_z": np.nan}
 
+        # keep only bars up to cutoff time for each day
         df = raw.copy()
         df = df[df.index.time < cutoff_time]
         if df.empty:
             return {"rvol": np.nan, "vol_mean": np.nan, "vol_std": np.nan, "vol_z": np.nan}
 
+        # cum volume per day up to cutoff
         vol_by_day = df.groupby(df.index.date)["volume"].sum()
+
+        # only use the prior sessions you want
         series = vol_by_day.reindex(hist_days).dropna()
         min_obs = max(3, int(cfg.rvol_lookback_sessions * 0.4))
         if len(series) < min_obs:
@@ -1721,6 +1579,7 @@ def compute_rvol_and_volstats_for_ticker(ticker: str, numerator_vol: float) -> D
         return {"rvol": rvol, "vol_mean": denom_mean, "vol_std": denom_std, "vol_z": vol_z}
     except Exception:
         return {"rvol": np.nan, "vol_mean": np.nan, "vol_std": np.nan, "vol_z": np.nan}
+
 
 logger.info("Stage 2: RVOL filter...")
 stage2_rows = []
@@ -1745,7 +1604,7 @@ if len(stage2_rows) == 0:
     print("\n" + "=" * 80)
     print("NO CANDIDATES FOUND")
     print("=" * 80)
-    print(f"Stage 1: {len(stage1_results)} -> Stage 2: 0")
+    print(f"Stage 1: {len(stage1_results)} → Stage 2: 0")
     print("Tip: lower rvol_min (e.g. 0.5), increase MAX_UNIVERSE, or reduce avg10_dollar_vol_min")
     print("=" * 80)
     raise SystemExit
@@ -1823,9 +1682,15 @@ if not df_cand.empty:
         df_cand = df_cand.merge(df_sec, on="ticker", how="left")
     df_cand["sector"] = df_cand["sector"].fillna("Unknown")
 
+# ============================================================
+# FILTER BY SCORE
+# ============================================================
 df_ranked = df_cand[df_cand["conviction_score"] >= cfg.score_min].copy()
 df_ranked = df_ranked.sort_values("conviction_score", ascending=False).reset_index(drop=True)
 
+# ============================================================
+# SECTOR CAPS
+# ============================================================
 def apply_sector_caps(df: pd.DataFrame, max_per_sector: int, target: int) -> pd.DataFrame:
     picks = []
     counts: Dict[str, int] = {}
@@ -1842,11 +1707,12 @@ def apply_sector_caps(df: pd.DataFrame, max_per_sector: int, target: int) -> pd.
     return pd.DataFrame(picks)
 
 df_pick = apply_sector_caps(df_ranked, cfg.max_per_sector, cfg.target_positions * PICK_BUFFER_MULT)
-stage2_map = {r["ticker"]: r for r in stage2_rows}
 
 # ============================================================
 # ALLOCATION (uses consistent compute_stop_auto)
 # ============================================================
+stage2_map = {r["ticker"]: r for r in stage2_rows}
+
 alloc_rows = []
 for _, r in df_pick.iterrows():
     tkr = r["ticker"]
@@ -1856,12 +1722,18 @@ for _, r in df_pick.iterrows():
     session_low = float(r.get("session_low", np.nan))
     atr14 = float(atr_for_stop(tkr))
 
+    # Intraday ATR + vol clustering (time-of-day + volatility shock)
     atr_intra = np.nan
     vol_mult = 1.0
     if ENABLE_INTRADAY_ATR or ENABLE_VOL_CLUSTERING_TOD:
         try:
             df5 = client.get_intraday_data(tkr, analysis_date, interval="5m", period=PROB_PERIOD)
             if df5 is not None and not df5.empty:
+                df5 = df5.copy()
+                if df5.index.tz is None:
+                    df5.index = df5.index.tz_localize(IST)
+                else:
+                    df5.index = df5.index.tz_convert(IST)
                 df5d = df5[df5.index.date == analysis_date]
                 pre5 = df5d[df5d.index <= as_of_et]
                 atr_intra = intraday_atr_from_5m(pre5)
@@ -1921,8 +1793,8 @@ for _, r in df_pick.iterrows():
         "Target": tp,
 
         "Shares": shares,
-        "Position ($)": pos_value,
-        "Risk ($)": actual_risk,
+        "Position (₹)": pos_value,
+        "Risk (₹)": actual_risk,
         "Score": score,
         "RVOL": float(r.get("rvol", np.nan)),
         "VolZ": float(r.get("vol_z", np.nan)),
@@ -1933,8 +1805,88 @@ for _, r in df_pick.iterrows():
 df_alloc = pd.DataFrame(alloc_rows).sort_values("Score", ascending=False).head(cfg.target_positions)
 
 # ============================================================
-# PROBABILITY MODEL (RR-aware)
+# PROBABILITY MODEL (ROBUSTNESS UPGRADES)
+# Key changes:
+#   1) Training simulation uses the SAME compute_stop_auto as allocation.
+#   2) Empirical stats store MeanR_NONE so EV can include P_NONE realistically.
+#   3) BestRR selection can skip unreachable targets (ATR / % cap).
 # ============================================================
+def prefetch_intraday_batch(
+    symbols: List[str],
+    interval: str,
+    period: str,
+    batch_size: int = 50,
+    ttl_seconds: int = INTRADAY_CACHE_TTL_5M,
+):
+    symbols = [s for s in symbols if isinstance(s, str) and len(s) > 0]
+
+    need = []
+    for s in symbols:
+        key = client._intraday_cache_key(s, interval, period)
+        cached = None if client.force_refresh else cache.get(key, ttl_seconds=ttl_seconds)
+
+        stale = False
+        if cached is None or (not isinstance(cached, pd.DataFrame)) or cached.empty:
+            stale = True
+        elif client.require_end_dt is not None:
+            # Ensure cached intraday extends past required simulation window
+            try:
+                last_ts = pd.Timestamp(cached.index.max())
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.tz_localize(UTC)
+                last_ts = last_ts.tz_convert(ET).to_pydatetime()
+                if last_ts < client.require_end_dt:
+                    stale = True
+            except Exception:
+                stale = True
+
+        if stale:
+            need.append(s)
+    if not need:
+        logger.info(f"Prefetch intraday: all cached (interval={interval}, period={period})")
+        return
+
+    logger.info(f"Prefetch intraday: downloading {len(need)}/{len(symbols)} uncached tickers...")
+
+    for i in tqdm(range(0, len(need), batch_size), desc="Prefetch intraday", leave=False):
+        chunk = need[i:i+batch_size]
+        try:
+            data = yf.download(
+                tickers=chunk, interval=interval, period=period,
+                group_by="ticker", auto_adjust=False, threads=True, progress=False
+            )
+            if data is None or data.empty:
+                continue
+
+            def _store_one(tkr: str, dft: pd.DataFrame):
+                if dft is None or dft.empty:
+                    return
+                idx = pd.to_datetime(dft.index)
+                if getattr(idx, "tz", None) is None:
+                    idx = idx.tz_localize(UTC)
+                idx = idx.tz_convert(ET)
+                dft = dft.copy()
+                dft.index = idx
+                dft.columns = [c.lower() for c in dft.columns]
+                out = pd.DataFrame({
+                    "open": dft.get("open"),
+                    "high": dft.get("high"),
+                    "low": dft.get("low"),
+                    "close": dft.get("close"),
+                    "volume": dft.get("volume"),
+                }).dropna(subset=["open", "high", "low", "close"])
+                cache.set(client._intraday_cache_key(tkr, interval, period), out)
+
+            if isinstance(data.columns, pd.MultiIndex):
+                for tkr in chunk:
+                    if tkr in data.columns.get_level_values(0):
+                        _store_one(tkr, data[tkr].dropna(how="all"))
+            else:
+                _store_one(chunk[0], data.dropna(how="all"))
+
+        except Exception:
+            continue
+
 def compute_orh(df: pd.DataFrame, d: date, or_end_clock: dtime) -> float:
     session_open, _ = get_session_open_close(d)
     or_end_dt = dt_combine(d, or_end_clock, ET)
@@ -1968,11 +1920,12 @@ def simulate_tp_sl_for_rrgrid(
     if not np.isfinite(entry) or entry <= 0:
         return None
 
+    # Compute structural anchors from PRE data only (no lookahead)
     bars15 = resample_ohlcv_intraday(df[df.index <= entry_ts], session_open, "15min")
     last15_low = float(bars15["low"].iloc[-1]) if not bars15.empty else np.nan
     session_low = float(pre["low"].min()) if not pre.empty else np.nan
     range_pre = float(pre["high"].max() - pre["low"].min()) if len(pre) else np.nan
-    atr_intra = intraday_atr_from_5m(resample_ohlcv_intraday(pre, session_open, "5min"))
+    atr_intra = intraday_atr_from_5m(pre)
     vol_mult = vol_cluster_multiplier(entry_ts.time(), atr_intra, atr14)
 
     stop = compute_stop_auto(
@@ -1985,6 +1938,8 @@ def simulate_tp_sl_for_rrgrid(
         atr_intra=atr_intra,
         vol_mult=vol_mult,
     )
+
+
 
     if not (np.isfinite(stop) and stop > 0 and stop < entry):
         return None
@@ -2040,16 +1995,22 @@ def simulate_tp_sl_for_rrgrid(
         results[rr] = {"label": hit, "R": R, "target": float(target)}
     return {"entry_ts": entry_ts, "entry": float(entry), "stop": float(stop), "rps": float(rps), "results": results}
 
+
 # -------------------------------
-# Historical MFE/MAE caps
+# Historical MFE/MAE caps (targets reachability)
 # -------------------------------
 def _mfe_mae_caps_from_raw_5m(raw_5m: pd.DataFrame, trading_days: List[date], entry_clock: dtime) -> Dict[str, Any]:
+    """Compute typical reachable upside (MFE) and drawdown (MAE) after entry until close.
+
+    Uses ONLY historical sessions in `trading_days` (caller should pass prior sessions).
+    """
     mfe_list: List[float] = []
     mae_list: List[float] = []
 
     if raw_5m is None or raw_5m.empty:
         return {"n": 0, "mfe_q": np.nan, "mae_q": np.nan, "mfe_med": np.nan, "mae_med": np.nan}
 
+    # Ensure tz-aware and sorted
     df = raw_5m.copy()
     if df.index.tz is None:
         df.index = df.index.tz_localize(ET)
@@ -2097,14 +2058,17 @@ def _mfe_mae_caps_from_raw_5m(raw_5m: pd.DataFrame, trading_days: List[date], en
     return {
         "n": int(n),
         "mfe_q": float(np.quantile(mfe_arr, MFE_QUANTILE)),
-        "mae_q": float(np.quantile(mae_arr, 0.80)),
+        "mae_q": float(np.quantile(mae_arr, 0.80)),  # informative; not used directly in risk sizing
         "mfe_med": float(np.median(mfe_arr)),
         "mae_med": float(np.median(mae_arr)),
     }
 
+
 def get_mfe_mae_caps(ticker: str, trading_days: List[date], entry_clock: dtime,
                     interval: str = PROB_INTERVAL, period: str = PROB_PERIOD,
                     ttl_seconds: int = 6 * 3600) -> Dict[str, Any]:
+    """Cached wrapper for MFE/MAE caps."""
+    # Limit to configured lookback
     days = list(trading_days)[-int(MFE_LOOKBACK_SESSIONS):] if trading_days else []
     key = f"mfe_mae_caps_v2::{ticker}::{entry_clock.strftime('%H%M')}::{interval}::{period}::{len(days)}::{MFE_QUANTILE}"
     cached = cache.get(key, ttl_seconds=ttl_seconds)
@@ -2162,11 +2126,13 @@ def features_for_day_from_5m(
     volume_z = float((cum_vol - vol_mean) / vol_std) if np.isfinite(vol_mean) and np.isfinite(vol_std) and vol_std > 1e-9 else np.nan
 
     range_pre = float(pre["high"].max() - pre["low"].min()) if len(pre) else np.nan
-    atr_intra = intraday_atr_from_5m(df[df.index <= pre.index[-1]])
-    vol_mult = vol_cluster_multiplier(entry_dt.time(), atr_intra, atr14)
+    atr_intra = intraday_atr_from_5m(pre)
+    vol_mult = vol_cluster_multiplier(entry_clock, atr_intra, atr14)
     atr_intra_rel = float(atr_intra / atr14) if (np.isfinite(atr_intra) and np.isfinite(atr14) and atr14 > 1e-9) else np.nan
     atr_rel = float(range_pre / atr14) if np.isfinite(atr14) and atr14 > 1e-9 else np.nan
 
+    # --- stop features at entry (robustness / alignment) ---
+    # Compute the same stop logic used in allocation/simulation, using ONLY data known up to entry.
     last15_low = np.nan
     try:
         bars15_pre = resample_ohlcv_intraday(pre, session_open, "15min")
@@ -2279,6 +2245,7 @@ def build_training_dataset_rraware(
     rows = []
     emp: Dict[Tuple[str, float], Dict[str, Any]] = {}
 
+    # We'll also compute global MeanR_NONE by rr for backoff
     none_R_by_rr: Dict[float, List[float]] = {float(rr): [] for rr in rr_grid}
 
     for tkr in tickers:
@@ -2304,8 +2271,10 @@ def build_training_dataset_rraware(
         counters = {float(rr): {"TP": 0, "SL": 0, "NONE": 0, "TIE": 0, "R_all": [], "R_none": []} for rr in rr_grid}
 
         for d in train_days:
-            cache_key = f"train_rr_us_v1_{tkr}_{d}_{entry_clock.strftime('%H%M')}_{stop_buffer}_{interval}_{tie_policy}"
+            rr_sig = hash(tuple([float(x) for x in rr_grid]))
+            cache_key = f"train_rr_nse_v5_{tkr}_{d}_{entry_clock.strftime('%H%M')}_{stop_buffer}_{interval}_{tie_policy}_{rr_sig}"
             cached = cache.get(cache_key, ttl_seconds=PROB_CACHE_TTL)
+
             if cached is not None:
                 pack = cached
             else:
@@ -2341,10 +2310,7 @@ def build_training_dataset_rraware(
                     atr14=atr14
                 )
 
-                if sim_pack is None:
-                    cache.set(cache_key, None)
-                    continue
-
+                # stop/target geometry features (barriers influence probabilities)
                 entry_px_sim = float(sim_pack.get("entry", np.nan))
                 rps_sim = float(sim_pack.get("rps", np.nan))
                 if np.isfinite(entry_px_sim) and entry_px_sim > 0 and np.isfinite(rps_sim) and rps_sim > 0:
@@ -2356,6 +2322,10 @@ def build_training_dataset_rraware(
                 else:
                     feat["stop_pct"] = np.nan
                     feat["stop_rel_atr"] = np.nan
+
+                if sim_pack is None:
+                    cache.set(cache_key, None)
+                    continue
 
                 feat["rvol_like"] = float(rvol_like)
 
@@ -2414,6 +2384,7 @@ def build_training_dataset_rraware(
 
     df = pd.DataFrame(rows)
 
+    # Sector delta
     if not df.empty:
         df["date"] = pd.to_datetime(df["date"]).dt.date
         rr0 = float(rr_grid[0]) if rr_grid else 1.0
@@ -2422,9 +2393,13 @@ def build_training_dataset_rraware(
         df = df.merge(sec_mean, on=["date","sector"], how="left")
         df["sector_delta"] = (df["ret_pre"] - df["sector_ret_mean"]).astype(float)
 
+    # Global mean R when NONE, by rr (fallback for tickers with no empirical NONE mean)
     global_mean_none: Dict[float, float] = {}
     for rr, arr in none_R_by_rr.items():
-        global_mean_none[rr] = float(np.nanmean(arr)) if arr else 0.0
+        if arr:
+            global_mean_none[rr] = float(np.nanmean(arr))
+        else:
+            global_mean_none[rr] = 0.0
 
     return df, emp, global_mean_none
 
@@ -2591,6 +2566,7 @@ def blend(p_model: float, p_emp: float, n_emp: int, k: int) -> float:
     w = float(n_emp / (n_emp + k))
     return float(w * p_emp + (1.0 - w) * p_model)
 
+# Precompute sector means for inference (sector_delta)
 sector_mean_ret_today: Dict[str, float] = {}
 if not df_alloc.empty:
     tmp = df_alloc.copy()
@@ -2639,7 +2615,6 @@ def compute_today_features_for_inference_rr(ticker: str, rr: float, stop_px: Opt
         stop_pct = float(rps / entry)
         if np.isfinite(atr14) and atr14 > 0:
             stop_rel_atr = float(rps / atr14)
-
     range_pre = float(cut_1m["high"].max() - cut_1m["low"].min())
     atr_rel = float(range_pre / atr14) if np.isfinite(atr14) and atr14 > 1e-9 else np.nan
 
@@ -2749,8 +2724,11 @@ if ENABLE_PROB_MODEL and not df_alloc.empty:
         if model is not None and X_cal is not None and y_cal is not None:
             calibration_bucket_report_multiclass(model, X_cal, y_cal, bins=10)
 
+        # Map for reachability checks (uses allocation stop/ATR)
         alloc_lookup = {str(r["Ticker"]): r for _, r in df_alloc.iterrows()}
 
+
+        # Precompute historical MFE/MAE caps for the final candidates (used to cap RR choices).
         mfe_caps_map: Dict[str, Dict[str, Any]] = {}
         if ENABLE_DYNAMIC_RR_CAP_FROM_MFE:
             try:
@@ -2762,10 +2740,10 @@ if ENABLE_PROB_MODEL and not df_alloc.empty:
             except Exception as e:
                 logger.warning(f"MFE cap computation failed (continuing without caps): {e}")
 
+        # Time scaling for reachability: later in the session we demand closer targets.
         session_minutes = max(1, int((session_close_et - session_open_et).total_seconds() / 60))
         mins_to_close_global = max(0, int((session_close_et - dt_combine(analysis_date, entry_clock)).total_seconds() / 60))
         remaining_scale = float(math.sqrt(max(min(mins_to_close_global / session_minutes, 1.0), 0.05)))
-
         out_rows = []
         for tkr in df_alloc["Ticker"].tolist():
             best = None
@@ -2776,120 +2754,222 @@ if ENABLE_PROB_MODEL and not df_alloc.empty:
             atr14_alloc = float(ar.get("ATR14", np.nan))
             rps_alloc = float(entry_px_alloc - stop_px_alloc) if np.isfinite(entry_px_alloc) and np.isfinite(stop_px_alloc) else np.nan
 
-            rr_candidates = list(RR_GRID)
-            max_rr_cap = float("inf")
-
-            if ENABLE_TARGET_REACHABILITY_FILTER and np.isfinite(entry_px_alloc) and entry_px_alloc > 0 and np.isfinite(rps_alloc) and rps_alloc > 0:
-                dist_cap = float("inf")
-                if np.isfinite(atr14_alloc) and atr14_alloc > 0:
-                    dist_cap = TARGET_MAX_ATR_MULT * atr14_alloc * remaining_scale
-                else:
-                    dist_cap = TARGET_MAX_PCT * entry_px_alloc * remaining_scale
-
-                if ENABLE_DYNAMIC_RR_CAP_FROM_MFE:
-                    caps = mfe_caps_map.get(tkr, None)
-                    if isinstance(caps, dict) and caps.get("n", 0) >= MFE_MIN_SAMPLES and np.isfinite(caps.get("mfe_q", np.nan)):
-                        dist_cap = min(dist_cap, float(caps["mfe_q"]) * entry_px_alloc * MFE_RR_SLACK)
-
-                if np.isfinite(dist_cap) and dist_cap > 0:
-                    max_rr_cap = float(dist_cap / rps_alloc)
-
-                rr_candidates = [float(rr) for rr in RR_GRID if float(rr) <= max_rr_cap + 1e-9]
-                if not rr_candidates:
-                    rr_candidates = [float(min(RR_GRID))]
-
-            for rr in rr_candidates:
-                rr = float(rr)
-
-                feat = compute_today_features_for_inference_rr(tkr, rr, stop_px=stop_px_alloc)
-                if feat is None:
-                    continue
-
-                p_model_tp = p_model_sl = p_model_none = np.nan
-                if model is not None:
-                    X = pd.DataFrame([feat])
-                    try:
-                        proba = model.predict_proba(X)[0]
-                        cls = list(model.classes_)
-                        p = {cls[i]: float(proba[i]) for i in range(len(cls))}
-                        p_model_tp = float(p.get("TP", np.nan))
-                        p_model_sl = float(p.get("SL", np.nan))
-                        p_model_none = float(p.get("NONE", np.nan))
-                        if not np.isfinite(p_model_none):
-                            p_model_none = max(0.0, 1.0 - (p_model_tp if np.isfinite(p_model_tp) else 0.0) - (p_model_sl if np.isfinite(p_model_sl) else 0.0))
-                    except Exception:
-                        pass
-
-                emp = emp_stats.get((tkr, rr), None)
-                if emp is not None:
-                    P_TP_e, P_SL_e, P_NONE_e, _, N_e = empirical_probs_from_counts(
-                        emp.get("TP", 0), emp.get("SL", 0), emp.get("NONE", 0), emp.get("TIE", 0), PROB_TIE_POLICY
-                    )
-                    ER_none = float(emp.get("MeanR_NONE", np.nan))
-                else:
-                    P_TP_e = P_SL_e = P_NONE_e = np.nan
-                    N_e = 0
-                    ER_none = np.nan
-
-                if not np.isfinite(ER_none):
-                    ER_none = float(global_mean_none.get(rr, 0.0))
-
-                P_TP = blend(p_model_tp, P_TP_e, N_e, PROB_PRIOR_BLEND_K)
-                P_SL = blend(p_model_sl, P_SL_e, N_e, PROB_PRIOR_BLEND_K)
-                P_NONE = blend(p_model_none, P_NONE_e, N_e, PROB_PRIOR_BLEND_K)
-
-                s = (P_TP if np.isfinite(P_TP) else 0.0) + (P_SL if np.isfinite(P_SL) else 0.0) + (P_NONE if np.isfinite(P_NONE) else 0.0)
-                if s > 0:
-                    P_TP, P_SL, P_NONE = P_TP / s, P_SL / s, P_NONE / s
-                else:
-                    continue
-
-                P_HIT = float(P_TP + P_SL)
-                denom_hit = P_HIT
-                P_TP_GivenHit = (P_TP / denom_hit) if denom_hit > 0 else np.nan
-
-                EV_R = float(rr * P_TP - 1.0 * P_SL + ER_none * P_NONE)
-
-                eps = 1e-12
-                ent = -float(P_TP*np.log(P_TP+eps) + P_SL*np.log(P_SL+eps) + P_NONE*np.log(P_NONE+eps))
-
-                ladder.append((rr, float(P_TP), float(P_SL), float(P_NONE), float(P_HIT), float(ER_none), float(EV_R), int(N_e)))
-
-                if (best is None) or (EV_R > best["EV_R"]):
-                    best = {
-                        "BestRR": rr,
-                        "MaxRR_Cap": float(max_rr_cap) if np.isfinite(max_rr_cap) else np.nan,
-                        "MFE_q": float(mfe_caps_map.get(tkr, {}).get("mfe_q", np.nan)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else np.nan,
-                        "MAE_q": float(mfe_caps_map.get(tkr, {}).get("mae_q", np.nan)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else np.nan,
-                        "MFE_N": int(mfe_caps_map.get(tkr, {}).get("n", 0)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else 0,
-                        "P_TP": float(P_TP),
-                        "P_SL": float(P_SL),
-                        "P_NONE": float(P_NONE),
-                        "P_HIT": float(P_HIT),
-                        "E_R_NONE": float(ER_none),
-                        "P_TP_GivenHit": float(P_TP_GivenHit) if np.isfinite(P_TP_GivenHit) else np.nan,
-                        "EV_R": float(EV_R),
-                        "Uncertainty": float(ent),
-                        "EmpN": int(N_e),
-                    }
-
-            if best is None:
-                continue
-
-            best["RR_Ladder"] = str([(r, round(pt,3), round(ps,3), round(pn,3), round(ph,3), round(ern,3), round(ev,3), n) for (r,pt,ps,pn,ph,ern,ev,n) in ladder])
-            best["Ticker"] = tkr
-            out_rows.append(best)
-
-        if out_rows:
-            df_prob = pd.DataFrame(out_rows)
-            df_alloc = df_alloc.merge(df_prob, on="Ticker", how="left")
-
-            if "BestRR" in df_alloc.columns:
-                rr_used = df_alloc["BestRR"].fillna(cfg.rr_min).astype(float)
-                df_alloc["Target"] = df_alloc["Entry"] + rr_used * (df_alloc["Entry"] - df_alloc["Stop"])
 
 # ============================================================
-# TAKE / PASS Column
+# BEST RR + PROBABILITY LADDER + MERGE (REPLACE OLD BLOCK FULLY)
+# ============================================================
+
+# If you don't already have this defined somewhere, keep it here:
+EMP_MIN_SAMPLES_FOR_RR = 30   # use empirical probs only when >= this samples
+PROB_DEBUG = False            # set True to print why some tickers fail
+
+import numpy as np
+import pandas as pd
+
+out_rows = []
+default_probs = np.array([0.33, 0.33, 0.34], dtype=float)
+
+# iterate rows of df_alloc (must contain: Ticker, Entry, Stop, optionally ATR14)
+for _, row in df_alloc.iterrows():
+    tkr = str(row.get("Ticker", ""))
+
+    entry_px_alloc = float(row.get("Entry", np.nan))
+    stop_px_alloc  = float(row.get("Stop", np.nan))
+
+    # risk per share
+    rps_alloc = entry_px_alloc - stop_px_alloc
+    if not (np.isfinite(entry_px_alloc) and np.isfinite(stop_px_alloc) and np.isfinite(rps_alloc) and rps_alloc > 0):
+        if PROB_DEBUG:
+            print("Skip invalid entry/stop:", tkr, entry_px_alloc, stop_px_alloc)
+        continue
+
+    atr14_alloc = float(row.get("ATR14", np.nan))
+
+    # Candidate RR grid (optionally capped by dynamic reachability)
+    rr_candidates = [float(x) for x in RR_GRID]
+    max_rr_cap = float("inf")
+
+    if ENABLE_TARGET_REACHABILITY_FILTER:
+        dist_cap = float("inf")
+
+        # Time-scaled cap: late in the day we demand closer targets.
+        if np.isfinite(atr14_alloc) and atr14_alloc > 0:
+            dist_cap = TARGET_MAX_ATR_MULT * atr14_alloc * remaining_scale
+        else:
+            dist_cap = TARGET_MAX_PCT * entry_px_alloc * remaining_scale
+
+        # Historical cap: typical reachable upside for this ticker at this entry time.
+        if ENABLE_DYNAMIC_RR_CAP_FROM_MFE:
+            caps = mfe_caps_map.get(tkr, None)
+            if isinstance(caps, dict) and caps.get("n", 0) >= MFE_MIN_SAMPLES and np.isfinite(caps.get("mfe_q", np.nan)):
+                dist_cap = min(dist_cap, float(caps["mfe_q"]) * entry_px_alloc * MFE_RR_SLACK)
+
+        if np.isfinite(dist_cap) and dist_cap > 0:
+            max_rr_cap = float(dist_cap / rps_alloc)
+
+        rr_candidates = [rr for rr in rr_candidates if rr <= max_rr_cap + 1e-9]
+        if not rr_candidates:
+            rr_candidates = [float(min(RR_GRID))]
+
+    best = None
+    ladder = []
+
+    for rr in rr_candidates:
+        rr = float(rr)
+
+        feat = compute_today_features_for_inference_rr(tkr, rr, stop_px=stop_px_alloc)
+        if feat is None:
+            if PROB_DEBUG:
+                print("feat None:", tkr, "rr", rr)
+            continue
+
+        # ---------- model probs ----------
+        p_model_tp = p_model_sl = p_model_none = np.nan
+        if model is not None:
+            X = pd.DataFrame([feat])
+
+            # Align columns to training schema (prevents missing/extra column errors)
+            if hasattr(model, "feature_names_in_"):
+                X = X.reindex(columns=list(model.feature_names_in_), fill_value=0.0)
+
+            # Clean numeric issues that commonly break predict_proba
+            X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            try:
+                proba = model.predict_proba(X)[0]
+                cls = list(model.classes_)
+                p = {cls[i]: float(proba[i]) for i in range(len(cls))}
+                p_model_tp = float(p.get("TP", np.nan))
+                p_model_sl = float(p.get("SL", np.nan))
+                p_model_none = float(p.get("NONE", np.nan))
+            except Exception as e:
+                if PROB_DEBUG:
+                    print("predict_proba failed:", tkr, "rr", rr, "err", repr(e))
+
+        # ---------- empirical probs ----------
+        emp = emp_stats.get((tkr, rr), None)
+        ER_none = np.nan
+        N_e = 0
+
+        if emp is not None:
+            P_TP_e, P_SL_e, P_NONE_e, _, N_e = empirical_probs_from_counts(
+                emp.get("TP", 0), emp.get("SL", 0), emp.get("NONE", 0), emp.get("TIE", 0), PROB_TIE_POLICY
+            )
+            ER_none = float(emp.get("MeanR_NONE", np.nan))
+        else:
+            P_TP_e = P_SL_e = P_NONE_e = np.nan
+
+        # fallback for expected R of NONE
+        if not np.isfinite(ER_none):
+            ER_none = float(global_mean_none.get(rr, 0.0))
+
+        # ---------- choose probs: empirical (if enough) else model ----------
+        if emp is not None and int(N_e) >= EMP_MIN_SAMPLES_FOR_RR:
+            P_TP, P_SL, P_NONE = float(P_TP_e), float(P_SL_e), float(P_NONE_e)
+        else:
+            P_TP, P_SL, P_NONE = float(p_model_tp), float(p_model_sl), float(p_model_none)
+
+        # if NONE missing, backfill
+        if not np.isfinite(P_NONE):
+            tp = P_TP if np.isfinite(P_TP) else 0.0
+            sl = P_SL if np.isfinite(P_SL) else 0.0
+            P_NONE = max(0.0, 1.0 - tp - sl)
+
+        # ---------- sanitize probs (prevents NaN EV / NaN best) ----------
+        probs = np.array([P_TP, P_SL, P_NONE], dtype=float)
+        probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = np.clip(probs, 0.0, 1.0)
+        s = probs.sum()
+        if s <= 0:
+            probs = default_probs.copy()
+        else:
+            probs /= s
+
+        P_TP, P_SL, P_NONE = probs
+        P_HIT = P_TP + P_SL
+        P_TP_GivenHit = (P_TP / P_HIT) if P_HIT > 0 else np.nan
+
+        # ---------- Robust EV: include expected R if no barrier hit ----------
+        EV_R = float(rr * P_TP - 1.0 * P_SL + ER_none * P_NONE)
+
+        # uncertainty = entropy
+        eps = 1e-12
+        ent = -float(P_TP*np.log(P_TP+eps) + P_SL*np.log(P_SL+eps) + P_NONE*np.log(P_NONE+eps))
+
+        ladder.append((rr, float(P_TP), float(P_SL), float(P_NONE), float(P_HIT), float(ER_none), float(EV_R), int(N_e)))
+
+        if (best is None) or (EV_R > best["EV_R"]):
+            best = {
+                "Ticker": tkr,
+                "BestRR": rr,
+                "MaxRR_Cap": float(max_rr_cap) if np.isfinite(max_rr_cap) else np.nan,
+                "MFE_q": float(mfe_caps_map.get(tkr, {}).get("mfe_q", np.nan)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else np.nan,
+                "MAE_q": float(mfe_caps_map.get(tkr, {}).get("mae_q", np.nan)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else np.nan,
+                "MFE_N": int(mfe_caps_map.get(tkr, {}).get("n", 0)) if ENABLE_DYNAMIC_RR_CAP_FROM_MFE else 0,
+                "P_TP": float(P_TP),
+                "P_SL": float(P_SL),
+                "P_NONE": float(P_NONE),
+                "P_HIT": float(P_HIT),
+                "E_R_NONE": float(ER_none),
+                "P_TP_GivenHit": float(P_TP_GivenHit) if np.isfinite(P_TP_GivenHit) else np.nan,
+                "EV_R": float(EV_R),
+                "Uncertainty": float(ent),
+                "EmpN": int(N_e),
+            }
+
+    # If everything failed for this ticker, still write a row (avoids NaN columns)
+    if best is None:
+        rr0 = float(min(RR_GRID))
+        best = {
+            "Ticker": tkr,
+            "BestRR": rr0,
+            "MaxRR_Cap": float(max_rr_cap) if np.isfinite(max_rr_cap) else np.nan,
+            "MFE_q": np.nan,
+            "MAE_q": np.nan,
+            "MFE_N": 0,
+            "P_TP": float(default_probs[0]),
+            "P_SL": float(default_probs[1]),
+            "P_NONE": float(default_probs[2]),
+            "P_HIT": float(default_probs[0] + default_probs[1]),
+            "E_R_NONE": float(global_mean_none.get(rr0, 0.0)),
+            "P_TP_GivenHit": np.nan,
+            "EV_R": float(rr0 * default_probs[0] - 1.0 * default_probs[1] + global_mean_none.get(rr0, 0.0) * default_probs[2]),
+            "Uncertainty": float(-np.sum(default_probs * np.log(default_probs + 1e-12))),
+            "EmpN": 0,
+        }
+        ladder = [(rr0, best["P_TP"], best["P_SL"], best["P_NONE"], best["P_HIT"], best["E_R_NONE"], best["EV_R"], 0)]
+
+    best["RR_Ladder"] = str([
+        (r, round(pt, 3), round(ps, 3), round(pn, 3), round(ph, 3), round(ern, 3), round(ev, 3), n)
+        for (r, pt, ps, pn, ph, ern, ev, n) in ladder
+    ])
+
+    out_rows.append(best)
+
+# ---------------------------
+# Merge ONCE (prevents MergeError + duplicate columns)
+# ---------------------------
+if out_rows:
+    df_prob = pd.DataFrame(out_rows)
+
+    # remove any older versions of these columns to keep merge clean
+    prob_cols = [c for c in df_prob.columns if c != "Ticker"]
+    df_alloc = df_alloc.drop(columns=prob_cols, errors="ignore")
+
+    df_alloc = df_alloc.merge(df_prob, on="Ticker", how="left")
+
+# ---------------------------
+# Update Target based on BestRR
+# ---------------------------
+if "BestRR" in df_alloc.columns:
+    rr_used = df_alloc["BestRR"].fillna(cfg.rr_min).astype(float)
+    df_alloc["Target"] = df_alloc["Entry"] + rr_used * (df_alloc["Entry"] - df_alloc["Stop"])
+
+
+
+
+# ============================================================
+# TAKE / PASS Column (Robustness: include P_HIT and P_NONE caps)
 # ============================================================
 if ENABLE_TAKE_COLUMN and not df_alloc.empty and all(c in df_alloc.columns for c in ["EV_R","P_SL","P_TP_GivenHit","Uncertainty","EmpN","VWAP_Zone","P_NONE","P_HIT"]):
     df_alloc = df_alloc.copy()
@@ -2930,6 +3010,7 @@ if ENABLE_TAKE_COLUMN and not df_alloc.empty and all(c in df_alloc.columns for c
 
 # ============================================================
 # REALIZED TP/SL CHECK
+# Robustness: if neither hits by eval_end, label as EOD (close-out)
 # ============================================================
 ENABLE_REALIZED_HIT_CHECK = True
 REALIZED_INTERVAL_PRIMARY = "1m"
@@ -3058,7 +3139,7 @@ def realized_tp_sl_outcome(
 
 if ENABLE_REALIZED_HIT_CHECK and not df_alloc.empty:
     eval_end_et = _realized_eval_end_et()
-    logger.info(f"Realized TP/SL check: scanning forward from entry until {eval_end_et} ET (tie_policy={PROB_TIE_POLICY})")
+    logger.info(f"Realized TP/SL check: scanning forward from entry until {eval_end_et} IST (tie_policy={PROB_TIE_POLICY})")
 
     realized_rows = []
     for _, r in df_alloc.iterrows():
@@ -3078,7 +3159,7 @@ if ENABLE_REALIZED_HIT_CHECK and not df_alloc.empty:
     df_alloc = df_alloc.merge(df_realized, on="Ticker", how="left")
 
     hit_counts = df_alloc["Hit"].fillna("EOD").value_counts().to_dict()
-    logger.info(f"Realized outcomes through {eval_end_et.time()} ET: {hit_counts}")
+    logger.info(f"Realized outcomes through {eval_end_et.time()} IST: {hit_counts}")
 
 # ============================================================
 # OUTPUT
@@ -3090,7 +3171,7 @@ else:
         "Ticker","Sector","Catalyst",
         "VWAP","VWAP_+1s","VWAP_+2s","VWAP_Zone",
         "Open","Entry","Stop","ATR14","Target",
-        "Shares","Position ($)","Score","RVOL","VolZ",
+        "Shares","Position (₹)","Score","RVOL","VolZ",
         "NewsFlag","NewsLatest"
     ]
     prob_cols = ["BestRR","MaxRR_Cap","MFE_q","MAE_q","MFE_N","P_TP","P_SL","P_NONE","P_HIT","E_R_NONE","P_TP_GivenHit","EV_R","Uncertainty","EmpN"]
@@ -3101,12 +3182,12 @@ else:
     master_table = df_alloc[cols].copy()
 
 print("\n" + "=" * 160)
-print("NYSE INTRADAY SCANNER - ROBUST ML (CONSISTENT STOPS + P(NONE) AWARE EV + TARGET REACHABILITY + VWAP sigma-BANDS + BREADTH REGIME)")
+print("NSE INTRADAY SCANNER - ROBUST ML (CONSISTENT STOPS + P(NONE) AWARE EV + TARGET REACHABILITY + VWAP σ-BANDS + BREADTH REGIME)")
 print("=" * 160)
 print(master_table.to_string(index=False) if not master_table.empty else "(empty)")
 
-total_exposure = float(df_alloc["Position ($)"].sum()) if not df_alloc.empty else 0.0
-portfolio_heat = float(df_alloc["Risk ($)"].sum()) if not df_alloc.empty else 0.0
+total_exposure = float(df_alloc["Position (₹)"].sum()) if not df_alloc.empty else 0.0
+portfolio_heat = float(df_alloc["Risk (₹)"].sum()) if not df_alloc.empty else 0.0
 
 print("\n" + "=" * 160)
 print("PORTFOLIO SUMMARY")
@@ -3118,18 +3199,18 @@ print(f"Extra robustness: minP_HIT={TAKE_MIN_P_HIT:.2f}, maxP_NONE={TAKE_MAX_P_N
 if early_block_reasons:
     print(f"Early blocked tickers: {len(early_block_reasons)} (earnings/news)")
 
-print(f"Total Exposure: ${total_exposure:,.2f}")
-print(f"Portfolio Heat: ${portfolio_heat:,.2f}")
+print(f"Total Exposure: ₹{total_exposure:,.2f}")
+print(f"Portfolio Heat: ₹{portfolio_heat:,.2f}")
 print(regime_note)
 
 if ENABLE_PROB_MODEL and not df_alloc.empty and "BestRR" in df_alloc.columns:
     entry_clock = as_of_et.time() if PROB_USE_ASOF_TIME else cfg.eval_time_default
-    print(f"Prob model: interval={PROB_INTERVAL}, train_days~{PROB_TRAIN_LOOKBACK_SESSIONS}, train_tickers<={PROB_TRAIN_TICKERS_MAX}, entry_time={entry_clock}")
+    print(f"Prob model: interval={PROB_INTERVAL}, train_days≈{PROB_TRAIN_LOOKBACK_SESSIONS}, train_tickers≤{PROB_TRAIN_TICKERS_MAX}, entry_time={entry_clock}")
     print(f"RR_GRID={RR_GRID} | BestRR chosen by max EV_R (includes E[R|NONE]) | Blend: n/(n+{PROB_PRIOR_BLEND_K}) | Tie policy: {PROB_TIE_POLICY}")
 
 if "TAKE" in df_alloc.columns:
-    print("TAKE is breadth-regime + VWAP-zone aware and also enforces min P(HIT) + max P(NONE).")
+    print("TAKE is breadth-regime + VWAP-zone aware and now also enforces min P(HIT) + max P(NONE).")
 
 print("=" * 160)
-print("SCAN COMPLETE (ET)")
+print("SCAN COMPLETE (IST)")
 print("=" * 160)
