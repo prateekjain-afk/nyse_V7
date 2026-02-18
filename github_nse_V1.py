@@ -35,6 +35,30 @@ except Exception:
 # ============================================================
 # USER CONFIG - EDIT THESE
 # ============================================================
+
+import streamlit as st
+
+# Set page config
+st.set_page_config(layout="wide", page_title="NYSE ML Scanner V7")
+
+st.title("🏹 NYSE Intraday ML Scanner")
+st.markdown("---")
+
+# Move your USER CONFIG into the Sidebar
+with st.sidebar:
+    st.header("⚙️ Scanner Settings")
+    MAX_UNIVERSE = st.number_input("Max Universe Size", 100, 1000, 550)
+    MAX_WORKERS = st.slider("Parallel Workers", 1, 10, 6)
+    RVOL_MIN_UI = st.slider("Min RVOL", 0.1, 2.0, 0.8)
+    
+    st.header("🔬 ML Thresholds")
+    TAKE_MIN_EV_UI = st.slider("Min EV (R)", 0.0, 0.2, 0.03)
+    
+    # Add a Trigger Button
+    run_scan = st.button("🚀 Run Full NYSE Scan", use_container_width=True)
+
+
+
 API_PROVIDER = "YFINANCE"
 API_KEY = ""
 
@@ -3184,7 +3208,37 @@ else:
 print("\n" + "=" * 160)
 print("NSE INTRADAY SCANNER - ROBUST ML (CONSISTENT STOPS + P(NONE) AWARE EV + TARGET REACHABILITY + VWAP σ-BANDS + BREADTH REGIME)")
 print("=" * 160)
-print(master_table.to_string(index=False) if not master_table.empty else "(empty)")
+# At the bottom of your script, replace the print(master_table) block:
+
+if not master_table.empty:
+    st.header("🎯 Trade Candidates")
+    
+    # Summary Metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Candidates", len(master_table))
+    c2.metric("Portfolio Heat", f"${portfolio_heat:,.2f}")
+    c3.metric("Breadth Ratio", f"{breadth_ratio:.2f}")
+    c4.metric("Regime Score", f"{regime_score:.2f}")
+
+    # Color coded table
+    def color_take(val):
+        color = '#2ecc71' if val == 'TAKE' else '#e74c3c'
+        return f'background-color: {color}; color: white; font-weight: bold;'
+
+    if "TAKE" in master_table.columns:
+        styled_df = master_table.style.applymap(color_take, subset=['TAKE'])
+    else:
+        styled_df = master_table
+
+    # Display the table
+    st.dataframe(styled_df, use_container_width=True, height=600)
+    
+    # Download Button
+    csv = master_table.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Download Results as CSV", csv, "nyse_scan_results.csv", "text/csv")
+else:
+    if run_scan:
+        st.error("No stocks passed the filters today. Try lowering the RVOL or Score requirements.")
 
 total_exposure = float(df_alloc["Position (₹)"].sum()) if not df_alloc.empty else 0.0
 portfolio_heat = float(df_alloc["Risk (₹)"].sum()) if not df_alloc.empty else 0.0
