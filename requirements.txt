@@ -1,8 +1,10 @@
-streamlit
-tqdm
 pandas
 numpy
-requests
 yfinance
-pytz
 scikit-learn
+requests
+tqdm
+pytz
+pandas_market_calendars
+exchange_calendars
+streamlit
